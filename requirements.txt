@@ -1,0 +1,14 @@
+streamlit   
+pandas
+pydeck
+humanize
+geopy
+spacy
+telethon
+python-dotenv
+python-dateutil
+beautifulsoup4
+cryptography
+watchdog
+six
+lxml
