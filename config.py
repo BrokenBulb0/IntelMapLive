@@ -10,21 +10,11 @@ MAX_ENTRIES: int = 500
 
 # Canales de Telegram a monitorear
 CHANNELS: List[Union[str, int]] = [
-    "Slavyangrad",
-    "medmannews",
-    "MiddleEastSpectator",
-    "infodefENGLAND",
-    "rnintel",
-    "GeoPWatch",
-    "intelslava",
-    "wartranslated",
-    "Suriyakmaps",
-    "Eurekapress",
-    "European_dissident"
+    "YOUR_FAVORITE_CHANNELS",
 ]
 
 # Grupo de monitorización
-MONITOR_GROUP =-1003090741091
+MONITOR_GROUP =(number of your group)
 
 # Configuración de directorios
 MEDIA_DIR = os.path.join(BASE_DIR, 'media')
