@@ -588,7 +588,7 @@ def main():
             st.write(f"Existe: {stats['exists']} · Tamaño: {stats['size']} bytes")
             st.write(f"Mensajes: {stats['count']} · Último ID: {stats['last_id']} · Último timestamp: {stats['last_ts']}")
 
-        with st.expander("🗺 Basemap"):
+        with st.expander("Basemap"):
             provider = "Mapbox" if (_mapbox_token) else "OpenStreetMap (TileLayer)"
             st.write(f"Proveedor: **{provider}**")
             st.write(f"Tiene token: `{bool(_mapbox_token)}`")
