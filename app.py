@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json, os, re, sqlite3
+import os, re, sqlite3, unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -12,15 +12,11 @@ import pydeck as pdk
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# ========= Config obligatoria (tu archivo) =========
+# ====== Config (NO tocar) ======
 from config import (
-    MAP_CENTER, DEFAULT_ZOOM, DB_PATH, MEDIA_DIR, DATA_DIR,
+    MAP_CENTER, DEFAULT_ZOOM, DB_PATH, MEDIA_DIR,
     COUNTRY_CENTROIDS, COUNTRY_ALIASES
 )
-
-# Ruta opcional al geojson (si no existe, la app sigue funcionando)
-COUNTRIES_GEOJSON = getattr(__import__("config"), "COUNTRIES_GEOJSON",
-                            os.path.join(DATA_DIR, "countries.geojson"))
 
 # Mapbox token opcional (tiles)
 try:
@@ -28,7 +24,7 @@ try:
 except Exception:
     pass
 
-# ========= UI =========
+# ====== UI ======
 PAGE_TITLE="IntelLive Pro"
 CARD_BG="#0F1426"; CARD_BORDER="#243145"; PRIMARY="#FF4B4B"
 IMG_EXT={".png",".jpg",".jpeg",".webp",".bmp",".gif"}
@@ -40,11 +36,11 @@ try:
 except Exception:
     st_autorefresh = None
 
-# ========= Setup =========
+# ====== Setup ======
 def setup_app():
     st.set_page_config(page_title=PAGE_TITLE, page_icon="🌍", layout="wide")
     Path(MEDIA_DIR).mkdir(parents=True, exist_ok=True)
-    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(os.path.dirname(DB_PATH) or ".").mkdir(parents=True, exist_ok=True)
 
     st.markdown(f"""
     <style>
@@ -69,7 +65,12 @@ def setup_app():
     st.session_state.setdefault("only_coords", False)
     st.session_state.setdefault("center_nonce", 0)
 
-# ========= Utils =========
+# ====== Utils ======
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
 def clean_text(text: Optional[str]) -> str:
     if not text: return ""
     try: clean = BeautifulSoup(text, "lxml").get_text()
@@ -110,7 +111,7 @@ def pick_preview(paths: List[str]) -> Tuple[Optional[str], Optional[str]]:
     if auds: return "audio", auds[0]
     return "other", paths[0]
 
-# ========= Overrides =========
+# ====== Overrides ======
 def ensure_override_table():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -145,100 +146,7 @@ def delete_override(message_id:int):
         conn.execute("DELETE FROM location_overrides WHERE message_id=?", (int(message_id),))
         conn.commit()
 
-# ========= Países: GeoJSON (opcional) y lookup =========
-def _feature_centroid(geom: dict) -> Optional[Tuple[float,float]]:
-    if not geom: return None
-    t = geom.get("type"); coords = geom.get("coordinates")
-    if not coords: return None
-    lat_sum=lon_sum=count=0
-    if t=="Polygon":
-        for ring in coords:
-            for lon,lat in ring:
-                lat_sum+=lat; lon_sum+=lon; count+=1
-    elif t=="MultiPolygon":
-        for poly in coords:
-            for ring in poly:
-                for lon,lat in ring:
-                    lat_sum+=lat; lon_sum+=lon; count+=1
-    return (lat_sum/count, lon_sum/count) if count else None
-
-@st.cache_data(ttl=3600)
-def load_countries_geojson(path:str):
-    if not os.path.exists(path): return None
-    with open(path,"r",encoding="utf-8") as f:
-        return json.load(f)
-
-@st.cache_data(ttl=3600)
-def build_country_lookup(geojson: Optional[dict]):
-    """
-    Retorna:
-      lookup: dict name_lower -> {name, code(ISO2/ADM0_A3), centroid}
-      pattern: regex para detectar nombres en texto
-    Si no hay geojson, arma un lookup mínimo con COUNTRY_CENTROIDS/ALIASES.
-    """
-    if not geojson:
-        # construir lookup mínimo desde config
-        inv = {}  # nombre_legible_lower -> ISO2
-        for iso2, (lat, lon, label) in COUNTRY_CENTROIDS.items():
-            inv[label.strip().lower()] = iso2
-        for alias, iso2 in COUNTRY_ALIASES.items():
-            inv[alias.strip().lower()] = iso2
-
-        lookup = {}
-        for name, iso2 in inv.items():
-            lat, lon, label = COUNTRY_CENTROIDS.get(iso2, (None, None, None))
-            if lat is None: continue
-            lookup[name] = {"name": label or name.title(), "code": iso2, "centroid": (lat, lon)}
-        pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in lookup.keys()) + r")\b", re.IGNORECASE) if lookup else re.compile(r"$a")
-        return lookup, pattern
-
-    lookup={}
-    names=set()
-    for f in geojson.get("features", []):
-        p=f.get("properties", {})
-        canon_name = (p.get("NAME") or p.get("NAME_EN") or p.get("ADMIN") or p.get("SOVEREIGNT") or "").strip()
-        if not canon_name: continue
-        # preferimos ISO_A2 si existe, si no ADM0_A3
-        code = (p.get("ISO_A2") or p.get("ADM0_A3") or p.get("WB_A2") or "").strip().upper()
-        centroid = _feature_centroid(f.get("geometry"))
-
-        # variantes para matchear
-        alts = {
-            canon_name,
-            p.get("NAME_LONG"), p.get("ADMIN"), p.get("ABBREV"),
-            p.get("NAME_EN"), p.get("SOVEREIGNT")
-        }
-        # también incorpora alias de config que mapeen a este code
-        for alias, iso2 in COUNTRY_ALIASES.items():
-            if iso2 and code and iso2.upper()==code.upper():
-                alts.add(alias)
-
-        altnames = {re.sub(r"\s+", " ", (x or "")).strip().lower() for x in alts if x}
-        altnames = {n for n in altnames if len(n) >= 3}
-        for n in altnames:
-            lookup[n] = {"name": canon_name, "code": code, "centroid": centroid}
-            names.add(n)
-
-    sorted_names = sorted(names, key=lambda s: (-len(s), s))
-    pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in sorted_names) + r")\b", re.IGNORECASE) if sorted_names else re.compile(r"$a")
-    return lookup, pattern
-
-def infer_country_from_text(text: str, lookup: dict, pattern: re.Pattern):
-    if not text: return None
-    m = pattern.search(text.lower())
-    if m:
-        rec = lookup.get(m.group(1).lower())
-        if rec and rec.get("centroid"): return rec
-    # intento por alias directos si no hubo match (fallback rápido)
-    for alias, iso2 in COUNTRY_ALIASES.items():
-        if re.search(rf"\b{re.escape(alias)}\b", text, flags=re.IGNORECASE):
-            cent = COUNTRY_CENTROIDS.get(iso2)
-            if cent:
-                lat, lon, label = cent
-                return {"name": label, "code": iso2, "centroid": (lat,lon)}
-    return None
-
-# ========= Datos =========
+# ====== Datos ======
 def _parse_timestamp_series(s: pd.Series) -> pd.Series:
     s0 = pd.to_datetime(s, utc=True, errors="coerce")
     if s0.notna().any(): 
@@ -253,10 +161,6 @@ def _parse_timestamp_series(s: pd.Series) -> pd.Series:
 
 @st.cache_data(ttl=15)
 def load_data() -> pd.DataFrame:
-    """
-    Una fila por mensaje, priorizando override si existe.
-    Sin filtros de fecha/coords aquí; se aplican fuera.
-    """
     base_cols = ["id","text","timestamp","media_paths","latitude","longitude","ubicacion","confidence",
                  "is_area","radius_km","admin_kind","admin_code","media_files","media_count","time_ago",
                  "area_str","overridden"]
@@ -319,60 +223,60 @@ def load_data() -> pd.DataFrame:
         if col not in df.columns: df[col]=None
     return df
 
-# ========= Fallback: inferir país por texto cuando no hay coords =========
-def augment_with_text_country_inference(df: pd.DataFrame, lookup: dict, pattern: re.Pattern) -> pd.DataFrame:
-    if df.empty: return df
+# ====== Inferencia país por texto (usa config) ======
+def _build_alias_regex() -> Optional[re.Pattern]:
+    if not COUNTRY_ALIASES: return None
+    keys = set(COUNTRY_ALIASES.keys())
+    # también acepta nombres legibles de COUNTRY_CENTROIDS
+    for iso2, (_, _, label) in COUNTRY_CENTROIDS.items():
+        if label: keys.add(_norm(label))
+    # ordenar por longitud para evitar que "congo" tape "congo-brazzaville"
+    ordered = sorted(keys, key=lambda s: (-len(s), s))
+    try:
+        return re.compile(r"\b(" + "|".join(re.escape(k) for k in ordered) + r")\b", re.IGNORECASE)
+    except Exception:
+        return None
+
+_ALIAS_RE = _build_alias_regex()
+
+def augment_with_text_country_inference(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or _ALIAS_RE is None: return df
     mask = df["latitude"].isna() | df["longitude"].isna()
     if not mask.any(): return df
 
     def _infer_row(row):
-        rec = infer_country_from_text(row.get("text",""), lookup, pattern)
-        if not rec or not rec.get("centroid"): 
+        text = (row.get("text") or "")
+        m = _ALIAS_RE.search(_norm(text))
+        if not m: return row
+        key = m.group(1).lower()
+        iso = COUNTRY_ALIASES.get(key)
+        if not iso:
+            # puede venir del label normalizado
+            for k_iso, (_, _, label) in COUNTRY_CENTROIDS.items():
+                if label and _norm(label) == key:
+                    iso = k_iso; break
+        if not iso or iso not in COUNTRY_CENTROIDS: 
             return row
-        lat, lon = rec["centroid"]
+        lat, lon, label = COUNTRY_CENTROIDS[iso]
         if pd.isna(row.get("latitude")): row["latitude"] = lat
         if pd.isna(row.get("longitude")): row["longitude"] = lon
         row["is_area"] = 1 if pd.isna(row.get("is_area")) or int(row.get("is_area") or 0)==0 else int(row["is_area"])
-        row["admin_code"] = row.get("admin_code") or rec.get("code")
+        row["admin_code"] = row.get("admin_code") or iso
         row["admin_kind"] = row.get("admin_kind") or "country"
-        row["ubicacion"] = row.get("ubicacion") or rec.get("name")
-        if pd.isna(row.get("confidence")): row["confidence"] = 0.35  # marcada como inferida
+        row["ubicacion"] = row.get("ubicacion") or label
+        if pd.isna(row.get("confidence")): row["confidence"] = 0.35
         return row
 
     df.loc[mask] = df.loc[mask].apply(_infer_row, axis=1)
     return df
 
-# ========= Map helpers =========
-def _find_country_feature(geojson, admin_code: Optional[str], label: Optional[str]):
-    if not geojson: return None
-    feats = geojson.get("features", [])
-    code = (admin_code or "").upper()
-    name = (label or "").lower()
-
-    def _props_ok(p):
-        vals = [p.get("ISO_A2"), p.get("ADM0_A3"), p.get("WB_A2")]
-        vals = [str(v).upper() for v in vals if v]
-        return code and (code in vals)
-
-    for f in feats:
-        p=f.get("properties",{})
-        if code and _props_ok(p):
-            return f
-    if name:
-        for f in feats:
-            p=f.get("properties",{})
-            n=(p.get("NAME") or p.get("NAME_EN") or p.get("ADMIN") or "").lower()
-            if n and (n==name or name in n):
-                return f
-    return None
-
-def render_map(points_df: pd.DataFrame, selected: Optional[dict], countries):
+# ====== Mapa (solo puntos) ======
+def render_map(points_df: pd.DataFrame, selected: Optional[dict]):
     pts = points_df.copy()
     pts = pts.dropna(subset=["latitude","longitude"])
     if not pts.empty:
         pts = pts[(pts["latitude"].between(-90,90)) & (pts["longitude"].between(-180,180))]
 
-    # View
     if selected and _valid_coords(selected.get("latitude"), selected.get("longitude")):
         zoom = 6 if int(selected.get("is_area",0))==1 else 13
         lat0 = float(selected["latitude"]); lon0 = float(selected["longitude"])
@@ -387,28 +291,12 @@ def render_map(points_df: pd.DataFrame, selected: Optional[dict], countries):
     deck_key = f"{deck_key_base}_{st.session_state.get('center_nonce',0)}"
     view_state = pdk.ViewState(latitude=lat0, longitude=lon0, zoom=zoom, pitch=45)
 
-    layers=[]
-    # capa países (debajo) solo si hay geojson
-    if countries:
-        countries_layer = pdk.Layer(
-            "GeoJsonLayer",
-            data=countries,
-            pickable=True,
-            stroked=True,
-            filled=True,
-            opacity=0.05,
-            get_fill_color=[0, 150, 255, 15],
-            get_line_color=[80, 160, 255, 120],
-            line_width_min_pixels=1,
-            auto_highlight=True,
-            highlight_color=[0, 255, 255, 140],
-        )
-        layers.append(countries_layer)
+    plot_df = pts.copy()
+    plot_df["hover_name"] = plot_df["ubicacion"].fillna("")
 
-    # puntos (encima)
     layer_points = pdk.Layer(
         "ScatterplotLayer",
-        data=pts,
+        data=plot_df,
         get_position=["longitude","latitude"],
         get_radius=9,
         radius_units="pixels",
@@ -419,16 +307,15 @@ def render_map(points_df: pd.DataFrame, selected: Optional[dict], countries):
         get_line_color=[255, 120, 120, 255],
         line_width_min_pixels=1,
     )
-    layers.append(layer_points)
 
     deck = pdk.Deck(
-        layers=layers,
+        layers=[layer_points],
         initial_view_state=view_state,
         map_style="mapbox://styles/mapbox/satellite-streets-v11",
         tooltip={
             "html": """
                 <div style="background:#0A0F24dd;border:2px solid #FF4B4B;border-radius:8px;padding:12px;max-width:420px">
-                    <div style="color:#FF4B4B;font-weight:700;font-size:1.05rem">{ubicacion}{properties.ADMIN}</div>
+                    <div style="color:#FF4B4B;font-weight:700;font-size:1.05rem">{hover_name}</div>
                     <div style="color:#E0F2FE;margin:8px 0;font-size:0.9rem">{text}</div>
                     <div style="color:#94A3B8;font-size:0.8rem">
                         🕒 {time_ago}{area_str} · 📎 {media_count} archivos
@@ -439,57 +326,35 @@ def render_map(points_df: pd.DataFrame, selected: Optional[dict], countries):
     )
     st.pydeck_chart(deck, use_container_width=True, key=deck_key)
 
-# ========= Corrección UI =========
-def _resolve_place_by_name(name: str, countries: Optional[dict]) -> Optional[Dict]:
-    """Devuelve dict con lat, lon, label, code (si país)."""
+# ====== Corrección ======
+def _resolve_place_by_name(name: str) -> Optional[Dict]:
+    """Devuelve dict con lat, lon, label, code si encuentra país; si no, intenta ciudad (geopy opcional)."""
     if not name: return None
-    q = name.strip().lower()
+    key = _norm(name)
 
-    # 1) GeoJSON (si existe)
-    if countries:
-        # construir lookup simple en memoria
-        feats = countries.get("features", [])
-        best = None
-        for f in feats:
-            p = f.get("properties", {})
-            labels = [
-                p.get("NAME"), p.get("NAME_EN"), p.get("ADMIN"),
-                p.get("SOVEREIGNT"), p.get("NAME_LONG"), p.get("ABBREV")
-            ]
-            labels = [str(x).strip().lower() for x in labels if x]
-            if any(q == lab or q in lab for lab in labels):
-                cen = _feature_centroid(f.get("geometry"))
-                if cen:
-                    code = (p.get("ISO_A2") or p.get("ADM0_A3") or "").strip().upper() or None
-                    best = {"lat": cen[0], "lon": cen[1], "label": p.get("ADMIN") or p.get("NAME") or name, "code": code}
-                    break
-        if best: return best
-
-    # 2) Alias + centroides de config (país)
-    iso2 = COUNTRY_ALIASES.get(q)
+    # 1) país por alias/label/ISO2
+    iso2 = COUNTRY_ALIASES.get(key)
     if not iso2:
-        # intenta con nombres legibles del dict de centroides
+        # probar contra labels del dict de centroides y el propio ISO2
         for k_iso2, (lat, lon, label) in COUNTRY_CENTROIDS.items():
-            if q == (label or "").strip().lower():
-                iso2 = k_iso2
-                break
+            if key in (_norm(label), _norm(k_iso2)):
+                iso2 = k_iso2; break
     if iso2 and iso2 in COUNTRY_CENTROIDS:
         lat, lon, label = COUNTRY_CENTROIDS[iso2]
-        return {"lat": lat, "lon": lon, "label": label, "code": iso2}
+        return {"lat": lat, "lon": lon, "label": label, "code": iso2, "is_area": 1}
 
-    # 3) (Opcional) Geocoder online si geopy está instalado
+    # 2) (opcional) ciudad via Nominatim si geopy está instalado
     try:
         from geopy.geocoders import Nominatim
         geocoder = Nominatim(user_agent="intellive_pro")
         loc = geocoder.geocode(name, timeout=10)
         if loc:
-            return {"lat": float(loc.latitude), "lon": float(loc.longitude), "label": name, "code": None}
+            return {"lat": float(loc.latitude), "lon": float(loc.longitude), "label": name, "code": None, "is_area": 0}
     except Exception:
         pass
-
     return None
 
-def _correction_form(row, countries):
+def _correction_form(row):
     with st.form(f"fix_{row['id']}"):
         st.markdown("**✏️ Corregir ubicación**")
         tabs = st.tabs(["Por nombre", "Por lat/lon"])
@@ -498,7 +363,7 @@ def _correction_form(row, countries):
             place_name = st.text_input("Lugar (país/ciudad/área)", value=row.get("ubicacion") or "")
             coln1, coln2 = st.columns(2)
             with coln1:
-                save_as_area = st.checkbox("Guardar como área (país)", value=True)
+                save_as_area = st.checkbox("Guardar como área (si es país)", value=True)
             with coln2:
                 radius_km = st.number_input("Radio km (opcional para área)", value=float(row.get("radius_km") or 0.0), min_value=0.0, step=10.0)
         with tabs[1]:
@@ -506,20 +371,21 @@ def _correction_form(row, countries):
             lon=st.number_input("Longitud", value=float(row["longitude"]) if pd.notna(row["longitude"]) else 0.0, format="%.6f")
             label=st.text_input("Etiqueta (opcional)", value=row.get("ubicacion") or "")
 
-        colf1, colf2 = st.columns([1,1])
-        submit = colf1.form_submit_button("Guardar")
+        submit = st.form_submit_button("Guardar")
         if submit:
-            # Prioridad: si puso nombre, usamos nombre; si no, lat/lon.
             if place_name.strip():
-                hit = _resolve_place_by_name(place_name, countries)
+                hit = _resolve_place_by_name(place_name)
                 if not hit:
-                    st.error("No pude resolver ese lugar. Agrega un alias en config.COUNTRY_ALIASES o provee lat/lon.")
+                    st.error("No pude resolver ese lugar. Intenta otro nombre o usa Lat/Lon.")
                     return
+                is_area = hit["is_area"] if hit["code"] else 0
+                if hit["code"] and save_as_area:
+                    is_area = 1
                 save_override(
                     int(row["id"]), float(hit["lat"]), float(hit["lon"]),
-                    hit["label"], int(save_as_area),
-                    (radius_km if save_as_area and radius_km>0 else None),
-                    "country" if (save_as_area and hit.get("code")) else None,
+                    hit["label"], int(is_area),
+                    (radius_km if is_area and radius_km>0 else None),
+                    "country" if (is_area and hit.get("code")) else None,
                     hit.get("code")
                 )
                 st.success(f"Ubicación corregida: {hit['label']} ✓"); st.rerun()
@@ -536,8 +402,8 @@ def _correction_form(row, countries):
         if st.button("🗑️ Borrar corrección", key=f"del_{row['id']}"):
             delete_override(int(row["id"])); st.success("Corrección eliminada"); st.rerun()
 
-# ========= Listado =========
-def render_list(df: pd.DataFrame, countries):
+# ====== Listado ======
+def render_list(df: pd.DataFrame):
     PAGE_SIZE=12
     total=len(df); total_pages=max(1, (total+PAGE_SIZE-1)//PAGE_SIZE)
 
@@ -596,11 +462,11 @@ def render_list(df: pd.DataFrame, countries):
                 st.session_state[f"show_fix_{row['id']}"]=True
 
             if st.session_state.get(f"show_fix_{row['id']}", False):
-                _correction_form(row, countries)
+                _correction_form(row)
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-# ========= Main =========
+# ====== Main ======
 def main():
     setup_app()
 
@@ -622,7 +488,7 @@ def main():
 
     df = load_data()
 
-    # Filtro temporal robusto
+    # Filtro temporal
     if not df.empty and time_range != "todo":
         days = 1 if time_range=="24h" else (3 if time_range=="3 días" else 30)
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
@@ -632,12 +498,8 @@ def main():
     if not df.empty and q:
         df = df[df["text"].str.contains(re.escape(q), case=False, na=False)]
 
-    # Países (para hover y mejor inferencia)
-    countries = load_countries_geojson(COUNTRIES_GEOJSON)
-    lookup, pattern = build_country_lookup(countries)
-
-    # Fallback de país por texto si faltan coords
-    df = augment_with_text_country_inference(df, lookup, pattern)
+    # Inferencia país por texto si faltan coords
+    df = augment_with_text_country_inference(df)
 
     # Vistas
     df_for_list = df.copy()
@@ -663,9 +525,9 @@ def main():
     cD.metric("ÁREAS", with_areas)
     cE.metric("PUNTOS (en mapa)", with_points_map)
 
-    render_map(df_for_map, st.session_state.get("selected_report"), countries)
+    render_map(df_for_map, st.session_state.get("selected_report"))
     st.markdown("---")
-    render_list(df_for_list, countries)
+    render_list(df_for_list)
 
 if __name__=="__main__":
     main()
