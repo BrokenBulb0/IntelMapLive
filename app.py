@@ -18,11 +18,12 @@ from config import (
     COUNTRY_CENTROIDS, COUNTRY_ALIASES
 )
 
-# Mapbox token opcional (tiles)
+# ====== Mapbox token (acepta dos nombres) + fallback
 try:
-    pdk.settings.mapbox_api_key = os.getenv("MAPBOX_API_KEY", "")
+    _mapbox_token = os.getenv("MAPBOX_API_KEY") or os.getenv("MAPBOX_ACCESS_TOKEN") or ""
+    pdk.settings.mapbox_api_key = _mapbox_token
 except Exception:
-    pass
+    _mapbox_token = ""
 
 # ====== UI ======
 PAGE_TITLE="IntelLive Pro"
@@ -64,6 +65,7 @@ def setup_app():
     st.session_state.setdefault("auto_refresh_on", False)
     st.session_state.setdefault("only_coords", False)
     st.session_state.setdefault("center_nonce", 0)
+    st.session_state.setdefault("refresh_nonce", 0)
 
 # ====== Utils ======
 def _norm(s: str) -> str:
@@ -105,25 +107,60 @@ def time_ago(ts: Optional[pd.Timestamp]) -> str:
     return humanize.naturaltime(now - ts).replace(" ago", "")
 
 def split_media_paths(media_paths: Optional[str]) -> List[str]:
-    if not media_paths: return []
+    """
+    Acepta lista separada por comas de rutas o URLs.
+    - Si es URL http(s): la devolvemos tal cual (Streamlit puede abrirla).
+    - Si es ruta absoluta pero NO existe: probamos MEDIA_DIR/basename y ./media/basename.
+    - Si es relativa: probamos MEDIA_DIR/relpath y MEDIA_DIR/basename, luego ./media/basename.
+    - Dedupe y filtrado (se mantienen URLs aunque no se puedan comprobar).
+    """
+    if not media_paths:
+        return []
     parts = [p.strip() for p in str(media_paths).split(",") if p.strip()]
-    out = []
+    resolved = []
+
     for p in parts:
+        if p.lower().startswith(("http://", "https://")):
+            resolved.append(p)
+            continue
+
         base = os.path.basename(p)
-        full = p if os.path.isabs(p) else os.path.join(MEDIA_DIR, base)
-        out.append(full)
-    seen=set(); uniq=[]
-    for p in out:
-        if p not in seen: uniq.append(p); seen.add(p)
-    return [p for p in uniq if os.path.exists(p)]
+        cand = []
+
+        if os.path.isabs(p):
+            cand.append(p)
+            cand.append(os.path.join(MEDIA_DIR, base))
+            cand.append(os.path.join("media", base))
+        else:
+            cand.append(os.path.join(MEDIA_DIR, p))
+            cand.append(os.path.join(MEDIA_DIR, base))
+            cand.append(os.path.join("media", base))
+
+        chosen = None
+        for c in cand:
+            try:
+                if os.path.exists(c):
+                    chosen = c
+                    break
+            except Exception:
+                continue
+        if chosen:
+            resolved.append(chosen)
+
+    out, seen = [], set()
+    for r in resolved:
+        if r not in seen:
+            out.append(r); seen.add(r)
+    return out
 
 def pick_preview(paths: List[str]) -> Tuple[Optional[str], Optional[str]]:
     if not paths: return None, None
-    imgs=[p for p in paths if os.path.splitext(p)[1].lower() in IMG_EXT]
+    def ext(p): return os.path.splitext(p)[1].lower()
+    imgs=[p for p in paths if ext(p) in IMG_EXT or p.lower().startswith(("http://","https://")) and any(x in p.lower() for x in (".png",".jpg",".jpeg",".webp",".gif",".bmp"))]
     if imgs: return "image", imgs[0]
-    vids=[p for p in paths if os.path.splitext(p)[1].lower() in VID_EXT]
+    vids=[p for p in paths if ext(p) in VID_EXT or p.lower().startswith(("http://","https://")) and any(x in p.lower() for x in (".mp4",".webm",".mov",".m4v"))]
     if vids: return "video", vids[0]
-    auds=[p for p in paths if os.path.splitext(p)[1].lower() in AUD_EXT]
+    auds=[p for p in paths if ext(p) in AUD_EXT or p.lower().startswith(("http://","https://")) and any(x in p.lower() for x in (".mp3",".wav",".ogg",".m4a",".aac"))]
     if auds: return "audio", auds[0]
     return "other", paths[0]
 
@@ -162,7 +199,7 @@ def delete_override(message_id:int):
         conn.execute("DELETE FROM location_overrides WHERE message_id=?", (int(message_id),))
         conn.commit()
 
-# ====== Datos ======
+# ====== DB helpers ======
 def _parse_timestamp_series(s: pd.Series) -> pd.Series:
     s0 = pd.to_datetime(s, utc=True, errors="coerce")
     if s0.notna().any(): 
@@ -175,8 +212,39 @@ def _parse_timestamp_series(s: pd.Series) -> pd.Series:
         return ts
     return s0
 
-@st.cache_data(ttl=15)
-def load_data() -> pd.DataFrame:
+def _db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    return conn
+
+def _db_stats() -> Dict[str, Optional[str]]:
+    stats = {"path": DB_PATH, "exists": os.path.exists(DB_PATH), "size": None, "count": None, "last_id": None, "last_ts": None}
+    if not stats["exists"]:
+        return stats
+    stats["size"] = os.path.getsize(DB_PATH)
+    try:
+        with _db_connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*), MAX(id), MAX(timestamp) FROM messages")
+            row = cur.fetchone() or (0, None, None)
+            stats["count"], stats["last_id"], stats["last_ts"] = row[0], row[1], row[2]
+    except Exception:
+        pass
+    return stats
+
+def _db_mtime() -> float:
+    try:
+        return os.path.getmtime(DB_PATH)
+    except Exception:
+        return 0.0
+
+@st.cache_data(ttl=0)
+def load_data(db_mtime: float, nonce: int) -> pd.DataFrame:
     base_cols = ["id","text","timestamp","media_paths","latitude","longitude","ubicacion","confidence",
                  "is_area","radius_km","admin_kind","admin_code","media_files","media_count","time_ago",
                  "area_str","overridden"]
@@ -209,7 +277,7 @@ def load_data() -> pd.DataFrame:
     """
 
     ensure_override_table()
-    with sqlite3.connect(DB_PATH) as conn:
+    with _db_connect() as conn:
         df = pd.read_sql(query, conn)
 
     if df.empty:
@@ -227,7 +295,6 @@ def load_data() -> pd.DataFrame:
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
     df["confidence"] = pd.to_numeric(df.get("confidence"), errors="coerce")
     df["radius_km"] = pd.to_numeric(df.get("radius_km"), errors="coerce")
-    # 👉 clave: evitar NaN → int
     df["is_area"] = pd.to_numeric(df.get("is_area"), errors="coerce").fillna(0).astype(int)
 
     def _area_str(r):
@@ -242,7 +309,7 @@ def load_data() -> pd.DataFrame:
         if col not in df.columns: df[col]=None
     return df
 
-# ====== Inferencia país por texto (usa config) ======
+# ====== Inferencia país por texto ======
 def _build_alias_regex() -> Optional[re.Pattern]:
     if not COUNTRY_ALIASES: return None
     keys = set(COUNTRY_ALIASES.keys())
@@ -287,7 +354,7 @@ def augment_with_text_country_inference(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[mask] = df.loc[mask].apply(_infer_row, axis=1)
     return df
 
-# ====== Mapa (solo puntos) ======
+# ====== Mapa (fallback a OSM si no hay token) ======
 def render_map(points_df: pd.DataFrame, selected: Optional[dict]):
     pts = points_df.copy()
     pts = pts.dropna(subset=["latitude","longitude"])
@@ -325,10 +392,27 @@ def render_map(points_df: pd.DataFrame, selected: Optional[dict]):
         line_width_min_pixels=1,
     )
 
+    has_mapbox = bool(_mapbox_token)
+
+    layers = [layer_points]
+    map_style = "mapbox://styles/mapbox/satellite-streets-v11"
+
+    if not has_mapbox:
+        tile_layer = pdk.Layer(
+            "TileLayer",
+            data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            min_zoom=0,
+            max_zoom=19,
+            tile_size=256,
+            opacity=1.0,
+        )
+        layers = [tile_layer, layer_points]
+        map_style = None
+
     deck = pdk.Deck(
-        layers=[layer_points],
+        layers=layers,
         initial_view_state=view_state,
-        map_style="mapbox://styles/mapbox/satellite-streets-v11",
+        map_style=map_style,
         tooltip={
             "html": """
                 <div style="background:#0A0F24dd;border:2px solid #FF4B4B;border-radius:8px;padding:12px;max-width:420px">
@@ -349,7 +433,6 @@ def _resolve_place_by_name(name: str) -> Optional[Dict]:
     if not name: return None
     key = _norm(name)
 
-    # 1) país por alias/label/ISO2
     iso2 = COUNTRY_ALIASES.get(key)
     if not iso2:
         for k_iso2, (lat, lon, label) in COUNTRY_CENTROIDS.items():
@@ -359,7 +442,6 @@ def _resolve_place_by_name(name: str) -> Optional[Dict]:
         lat, lon, label = COUNTRY_CENTROIDS[iso2]
         return {"lat": lat, "lon": lon, "label": label, "code": iso2, "is_area": 1}
 
-    # 2) (opcional) ciudad via Nominatim si geopy está instalado
     try:
         from geopy.geocoders import Nominatim
         geocoder = Nominatim(user_agent="intellive_pro")
@@ -444,7 +526,6 @@ def render_list(df: pd.DataFrame):
 
             meta=row.get("time_ago","")
             if pd.notna(row.get("confidence")): meta=f"{meta} · conf {row['confidence']:.2f}"
-            # 👉 sin castear NaN a int
             is_area_flag = (as_int(row.get("is_area"),0)==1)
             if is_area_flag and pd.notna(row.get("radius_km")):
                 meta=f"{meta} · área ~{float(row['radius_km']):.0f} km"
@@ -489,12 +570,28 @@ def main():
     setup_app()
 
     with st.sidebar:
-        st.markdown("### ⚙️ Controles")
+        st.markdown("Controles")
         show_all=st.checkbox("Mostrar todo el historial", value=st.session_state.show_all); st.session_state.show_all=show_all
         time_range = st.selectbox("Rango temporal", ["24h","3 días","30 días"] if not show_all else ["todo"], index=2 if not show_all else 0)
         q = st.text_input("Buscar texto…", value=st.session_state.last_query).strip()
         only_coords = st.checkbox("Solo con ubicación", value=st.session_state.only_coords); st.session_state.only_coords=only_coords
         auto_refresh = st.checkbox("Auto-actualizar cada 15s", value=st.session_state.auto_refresh_on); st.session_state.auto_refresh_on=auto_refresh
+
+        colr1, colr2 = st.columns([1,1])
+        if colr1.button("Recargar ahora"):
+            st.session_state.refresh_nonce += 1
+            st.rerun()
+
+        with st.expander("Diagnóstico DB"):
+            stats = _db_stats()
+            st.write(f"Ruta DB: `{stats['path']}`")
+            st.write(f"Existe: {stats['exists']} · Tamaño: {stats['size']} bytes")
+            st.write(f"Mensajes: {stats['count']} · Último ID: {stats['last_id']} · Último timestamp: {stats['last_ts']}")
+
+        with st.expander("🗺 Basemap"):
+            provider = "Mapbox" if (_mapbox_token) else "OpenStreetMap (TileLayer)"
+            st.write(f"Proveedor: **{provider}**")
+            st.write(f"Tiene token: `{bool(_mapbox_token)}`")
 
     if st.session_state.auto_refresh_on and st_autorefresh is not None:
         st_autorefresh(interval=15000, key="data_refresh")
@@ -504,7 +601,9 @@ def main():
         st.session_state.last_query = q
         st.session_state.last_range = time_range
 
-    df = load_data()
+    # cache-bust con mtime + nonce
+    db_mtime = _db_mtime()
+    df = load_data(db_mtime, st.session_state.refresh_nonce)
 
     # Filtro temporal
     if not df.empty and time_range != "todo":
@@ -516,7 +615,7 @@ def main():
     if not df.empty and q:
         df = df[df["text"].str.contains(re.escape(q), case=False, na=False)]
 
-    # Inferencia país por texto si faltan coords
+    # Inferencia país si faltan coords
     df = augment_with_text_country_inference(df)
 
     # Vistas
@@ -528,7 +627,7 @@ def main():
     if st.session_state.only_coords:
         df_for_list = df_for_map
 
-    st.markdown('<div class="headline"><h1>🌍 Mapa</h1></div>', unsafe_allow_html=True)
+    st.markdown('<div class="headline"><h1>Mapa</h1></div>', unsafe_allow_html=True)
     cA,cB,cC,cD,cE = st.columns(5)
 
     total=len(df_for_list)
