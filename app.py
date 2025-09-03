@@ -12,7 +12,7 @@ import pydeck as pdk
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# ====== Config (NO tocar) ======
+# ====== Config (no tocar) ======
 from config import (
     MAP_CENTER, DEFAULT_ZOOM, DB_PATH, MEDIA_DIR,
     COUNTRY_CENTROIDS, COUNTRY_ALIASES
@@ -70,6 +70,22 @@ def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
     return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+def as_int(x, default: int = 0) -> int:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return default
+        return int(float(x))
+    except Exception:
+        return default
+
+def as_float(x, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return default
+        return float(x)
+    except Exception:
+        return default
 
 def clean_text(text: Optional[str]) -> str:
     if not text: return ""
@@ -210,6 +226,9 @@ def load_data() -> pd.DataFrame:
     df["latitude"]  = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
     df["confidence"] = pd.to_numeric(df.get("confidence"), errors="coerce")
+    df["radius_km"] = pd.to_numeric(df.get("radius_km"), errors="coerce")
+    # 👉 clave: evitar NaN → int
+    df["is_area"] = pd.to_numeric(df.get("is_area"), errors="coerce").fillna(0).astype(int)
 
     def _area_str(r):
         try:
@@ -217,7 +236,7 @@ def load_data() -> pd.DataFrame:
         except Exception:
             return ""
     df["area_str"] = df["radius_km"].map(_area_str)
-    df["overridden"] = df["overridden"].fillna(0).astype(int)
+    df["overridden"] = pd.to_numeric(df["overridden"], errors="coerce").fillna(0).astype(int)
 
     for col in base_cols:
         if col not in df.columns: df[col]=None
@@ -227,10 +246,8 @@ def load_data() -> pd.DataFrame:
 def _build_alias_regex() -> Optional[re.Pattern]:
     if not COUNTRY_ALIASES: return None
     keys = set(COUNTRY_ALIASES.keys())
-    # también acepta nombres legibles de COUNTRY_CENTROIDS
     for iso2, (_, _, label) in COUNTRY_CENTROIDS.items():
         if label: keys.add(_norm(label))
-    # ordenar por longitud para evitar que "congo" tape "congo-brazzaville"
     ordered = sorted(keys, key=lambda s: (-len(s), s))
     try:
         return re.compile(r"\b(" + "|".join(re.escape(k) for k in ordered) + r")\b", re.IGNORECASE)
@@ -251,16 +268,16 @@ def augment_with_text_country_inference(df: pd.DataFrame) -> pd.DataFrame:
         key = m.group(1).lower()
         iso = COUNTRY_ALIASES.get(key)
         if not iso:
-            # puede venir del label normalizado
             for k_iso, (_, _, label) in COUNTRY_CENTROIDS.items():
                 if label and _norm(label) == key:
                     iso = k_iso; break
-        if not iso or iso not in COUNTRY_CENTROIDS: 
+        if not iso or iso not in COUNTRY_CENTROIDS:
             return row
         lat, lon, label = COUNTRY_CENTROIDS[iso]
         if pd.isna(row.get("latitude")): row["latitude"] = lat
         if pd.isna(row.get("longitude")): row["longitude"] = lon
-        row["is_area"] = 1 if pd.isna(row.get("is_area")) or int(row.get("is_area") or 0)==0 else int(row["is_area"])
+        current = as_int(row.get("is_area"), 0)
+        row["is_area"] = 1 if current == 0 else current
         row["admin_code"] = row.get("admin_code") or iso
         row["admin_kind"] = row.get("admin_kind") or "country"
         row["ubicacion"] = row.get("ubicacion") or label
@@ -278,7 +295,7 @@ def render_map(points_df: pd.DataFrame, selected: Optional[dict]):
         pts = pts[(pts["latitude"].between(-90,90)) & (pts["longitude"].between(-180,180))]
 
     if selected and _valid_coords(selected.get("latitude"), selected.get("longitude")):
-        zoom = 6 if int(selected.get("is_area",0))==1 else 13
+        zoom = 6 if as_int(selected.get("is_area"), 0)==1 else 13
         lat0 = float(selected["latitude"]); lon0 = float(selected["longitude"])
         deck_key_base = f"deck_{selected.get('id')}"
     elif not pts.empty:
@@ -335,7 +352,6 @@ def _resolve_place_by_name(name: str) -> Optional[Dict]:
     # 1) país por alias/label/ISO2
     iso2 = COUNTRY_ALIASES.get(key)
     if not iso2:
-        # probar contra labels del dict de centroides y el propio ISO2
         for k_iso2, (lat, lon, label) in COUNTRY_CENTROIDS.items():
             if key in (_norm(label), _norm(k_iso2)):
                 iso2 = k_iso2; break
@@ -365,10 +381,10 @@ def _correction_form(row):
             with coln1:
                 save_as_area = st.checkbox("Guardar como área (si es país)", value=True)
             with coln2:
-                radius_km = st.number_input("Radio km (opcional para área)", value=float(row.get("radius_km") or 0.0), min_value=0.0, step=10.0)
+                radius_km = st.number_input("Radio km (opcional para área)", value=as_float(row.get("radius_km"), 0.0) or 0.0, min_value=0.0, step=10.0)
         with tabs[1]:
-            lat=st.number_input("Latitud", value=float(row["latitude"]) if pd.notna(row["latitude"]) else 0.0, format="%.6f")
-            lon=st.number_input("Longitud", value=float(row["longitude"]) if pd.notna(row["longitude"]) else 0.0, format="%.6f")
+            lat=st.number_input("Latitud", value=as_float(row.get("latitude"), 0.0) or 0.0, format="%.6f")
+            lon=st.number_input("Longitud", value=as_float(row.get("longitude"), 0.0) or 0.0, format="%.6f")
             label=st.text_input("Etiqueta (opcional)", value=row.get("ubicacion") or "")
 
         submit = st.form_submit_button("Guardar")
@@ -398,7 +414,7 @@ def _correction_form(row):
                 )
                 st.success("Ubicación corregida ✓"); st.rerun()
 
-    if int(row.get("overridden") or 0)==1:
+    if as_int(row.get("overridden"), 0)==1:
         if st.button("🗑️ Borrar corrección", key=f"del_{row['id']}"):
             delete_override(int(row["id"])); st.success("Corrección eliminada"); st.rerun()
 
@@ -423,12 +439,14 @@ def render_list(df: pd.DataFrame):
         with cols[i%3]:
             st.markdown('<div class="card">', unsafe_allow_html=True)
             title=row.get("ubicacion") or "Ubicación"
-            badge=" ✅ Corregida" if int(row.get("overridden") or 0)==1 else ""
+            badge=" ✅ Corregida" if as_int(row.get("overridden"),0)==1 else ""
             st.markdown(f"<div class='title'>{title}{badge}</div>", unsafe_allow_html=True)
 
             meta=row.get("time_ago","")
             if pd.notna(row.get("confidence")): meta=f"{meta} · conf {row['confidence']:.2f}"
-            if int(row.get("is_area") or 0)==1 and pd.notna(row.get("radius_km")):
+            # 👉 sin castear NaN a int
+            is_area_flag = (as_int(row.get("is_area"),0)==1)
+            if is_area_flag and pd.notna(row.get("radius_km")):
                 meta=f"{meta} · área ~{float(row['radius_km']):.0f} km"
             st.markdown(f"<div class='meta'>{meta}</div>", unsafe_allow_html=True)
 
@@ -447,13 +465,13 @@ def render_list(df: pd.DataFrame):
             if colb1.button("📍 Centrar", key=f"center_{row['id']}"):
                 st.session_state.selected_report={
                     "id": int(row["id"]),
-                    "latitude": float(row["latitude"]) if pd.notna(row["latitude"]) else None,
-                    "longitude": float(row["longitude"]) if pd.notna(row["longitude"]) else None,
+                    "latitude": as_float(row.get("latitude")),
+                    "longitude": as_float(row.get("longitude")),
                     "ubicacion": row.get("ubicacion") or "",
                     "text": row.get("text") or "",
                     "time_ago": row.get("time_ago") or "",
                     "media_count": int(row.get("media_count") or 0),
-                    "is_area": int(row.get("is_area") or 0),
+                    "is_area": as_int(row.get("is_area"),0),
                     "admin_code": row.get("admin_code") or "",
                     "admin_kind": row.get("admin_kind") or ""
                 }
