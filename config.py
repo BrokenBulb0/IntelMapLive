@@ -4,8 +4,8 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Configuración del mapa
-MAP_CENTER: Tuple[float, float] = (48.3794, 31.1656)
-DEFAULT_ZOOM: int = 5
+MAP_CENTER: Tuple[float, float] = (0.00, 0.00)
+DEFAULT_ZOOM: int = 1
 MAX_ENTRIES: int = 500
 
 # Canales de Telegram a monitorear
